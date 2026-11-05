@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1f6f4a">
+<title>Walk Tracker</title>
+<link rel="stylesheet" href="lib/leaflet/leaflet.css">
+<style>
+:root{--g:#1f6f4a;--gd:#154d34;--r:#c0392b;--bg:#f4f6f3;--card:#fff;--tx:#1b2a22;--mu:#64756b}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--tx);
+ padding-bottom:env(safe-area-inset-bottom)}
+header{background:var(--g);color:#fff;padding:calc(10px + env(safe-area-inset-top)) 14px 10px;display:flex;justify-content:space-between;align-items:center}
+header h1{font-size:18px;margin:0}
+header button{background:rgba(255,255,255,.2);color:#fff;border:0;border-radius:8px;padding:6px 10px;font-size:14px}
+#map{height:42vh;min-height:260px;width:100%}
+.stats{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;padding:10px}
+.stat{grid-column:span 2}.stat.w{grid-column:span 3}
+.stat{background:var(--card);border-radius:10px;padding:8px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.stat b{display:block;font-size:22px;font-variant-numeric:tabular-nums}
+.stat span{font-size:11px;color:var(--mu);text-transform:uppercase;letter-spacing:.04em}
+.ctl{display:flex;gap:10px;padding:0 10px 8px}
+.ctl button{flex:1;border:0;border-radius:12px;padding:16px;font-size:18px;font-weight:600;color:#fff;background:var(--g)}
+.ctl button.stop{background:var(--r)}
+.ctl button.alt{background:#8a6d1f}
+.ctl button:disabled{opacity:.4}
+#msg{padding:0 12px 6px;font-size:13px;color:var(--mu);min-height:18px}
+h2{font-size:15px;margin:10px 12px 6px}
+.walk{background:var(--card);margin:6px 10px;border-radius:10px;padding:10px 12px;box-shadow:0 1px 3px rgba(0,0,0,.08);display:flex;justify-content:space-between;gap:8px;align-items:center}
+.walk .t{font-weight:600}.walk .s{font-size:13px;color:var(--mu)}
+.walk button{border:0;background:#eef2ee;border-radius:8px;padding:6px 9px;font-size:13px;margin-left:4px}
+canvas{display:block;margin:6px 10px;width:calc(100% - 20px);height:90px;background:var(--card);border-radius:10px}
+.tot{margin:0 12px 6px;font-size:13px;color:var(--mu)}
+</style>
+</head>
+<body>
+<header><h1>🥾 Walk Tracker</h1><button id="unitBtn"></button></header>
+<div id="map"></div>
+<div id="msg"></div>
+<div class="stats">
+ <div class="stat"><b id="sDist">0.00</b><span id="sDistU">mi</span></div>
+ <div class="stat"><b id="sTime">0:00</b><span>time</span></div>
+ <div class="stat"><b id="sPace">--</b><span id="sPaceU">min/mi</span></div>
+ <div class="stat w"><b id="sDelta">0</b><span id="sDeltaU">ft total climb</span></div>
+ <div class="stat w"><b id="sElev">--</b><span id="sElevU">ft now</span></div>
+</div>
+<div class="ctl">
+ <button id="btnStart">Start walk</button>
+ <button id="btnPause" class="alt" disabled>Pause</button>
+ <button id="btnStop" class="stop" disabled>Stop</button>
+</div>
+<canvas id="prof" hidden></canvas>
+<h2>Past walks</h2>
+<div class="tot" id="tot"></div>
+<div id="list"></div>
+
+<script src="lib/leaflet/leaflet.js"></script>
+<script>
+window.addEventListener("error",function(e){var m=document.getElementById("msg");if(m)m.textContent="JS error: "+e.message+" @"+(e.lineno||"?")});
+window.addEventListener("unhandledrejection",function(e){var m=document.getElementById("msg");if(m)m.textContent="Promise error: "+((e.reason&&e.reason.message)||e.reason)});
+</script>
+<script>
+(function(){
+"use strict";
+var KEY="walks.v1", ACT="walks.active", UNIT="walks.unit";
+var $=function(i){return document.getElementById(i)};
+function lsGet(k,d){try{var v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return d}}
+function lsSet(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
+function lsDel(k){try{localStorage.removeItem(k)}catch(e){}}
+
+var imperial = lsGet(UNIT,true);
+var walks = lsGet(KEY,[]);
+var NATIVE=!!(window.Capacitor&&Capacitor.isNativePlatform&&Capacitor.isNativePlatform());
+var BG=NATIVE?(Capacitor.Plugins&&Capacitor.Plugins.BackgroundGeolocation)||(Capacitor.registerPlugin&&Capacitor.registerPlugin("BackgroundGeolocation")):null;
+var cur=null;            // active walk
+var watchId=null, timer=null, wake=null;
+var MIN_MOVE=4, MAX_ACC=30, ELEV_STEP=3, MAX_SPEED=12;
+
+/* ---- map ---- */
+var map=L.map("map",{zoomControl:true}).setView([34.88,-83.96],13);
+var osm=L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:19,attribution:"© OpenStreetMap"});
+var topo=L.tileLayer("https://tile.opentopomap.org/{z}/{x}/{y}.png",{maxZoom:17,attribution:"© OpenTopoMap"});
+osm.addTo(map);
+L.control.layers({"Street":osm,"Topo (contours)":topo}).addTo(map);
+var line=L.polyline([],{color:"#d6336c",weight:5}).addTo(map);
+var dot=null, startMk=null;
+
+/* ---- helpers ---- */
+function hav(a,b){var R=6371000,r=Math.PI/180,dLa=(b.lat-a.lat)*r,dLo=(b.lon-a.lon)*r;
+ var x=Math.sin(dLa/2)*Math.sin(dLa/2)+Math.cos(a.lat*r)*Math.cos(b.lat*r)*Math.sin(dLo/2)*Math.sin(dLo/2);
+ return 2*R*Math.asin(Math.sqrt(x))}
+function fmtT(s){s=Math.round(s);var h=Math.floor(s/3600),m=Math.floor(s%3600/60),c=s%60;
+ return h?h+":"+String(m).padStart(2,"0")+":"+String(c).padStart(2,"0"):m+":"+String(c).padStart(2,"0")}
+function sgn(m){var v=Math.round(elev(m));return(v>0?"+":v<0?"\u2212":"")+Math.abs(v)}
+function dist(m){return imperial?m/1609.344:m/1000}
+function elev(m){return imperial?m*3.28084:m}
+function pace(w){var d=dist(w.dist);return d>0.02&&w.time>0?fmtT(w.time/d):"--"}
+function elapsed(w){return w.acc+(w.running?(Date.now()-w.since)/1000:0)}
+
+/* ---- live stats ---- */
+function render(){
+ $("unitBtn").textContent=imperial?"mi / ft":"km / m";
+ $("sDistU").textContent=imperial?"mi":"km";$("sPaceU").textContent=imperial?"min/mi":"min/km";
+ $("sDeltaU").textContent=(imperial?"ft":"m")+" total climb";
+ $("sElevU").textContent=(imperial?"ft":"m")+" now";
+ var w=cur;
+ if(!w){return}
+ w.time=elapsed(w);
+ $("sDist").textContent=dist(w.dist).toFixed(2);
+ $("sTime").textContent=fmtT(w.time);
+ $("sPace").textContent=pace(w);
+ $("sDelta").textContent=Math.round(elev(w.gain));
+ $("sElev").textContent=w.lastAlt==null?"--":Math.round(elev(w.lastAlt));
+}
+
+/* ---- tracking ---- */
+function onFix(p){
+ if(!cur||!cur.running)return;
+ var c=p.coords, pt={lat:c.latitude,lon:c.longitude,t:p.timestamp,alt:c.altitude};
+ $("msg").textContent="GPS accuracy ±"+Math.round(c.accuracy)+" m";
+ if(c.accuracy>MAX_ACC)return;
+ var pts=cur.pts,last=pts[pts.length-1];
+ if(last){
+  var d=hav(last,pt), dt=(pt.t-last.t)/1000;
+  if(d<Math.max(MIN_MOVE,c.accuracy*0.4))return;       // jitter while standing
+  if(dt>0&&d/dt>MAX_SPEED)return;                      // GPS jump
+  cur.dist+=d;
+ }
+ // elevation: smooth, then count only steps >= ELEV_STEP
+ if(pt.alt!=null&&!isNaN(pt.alt)){
+  cur.altBuf.push(pt.alt); if(cur.altBuf.length>5)cur.altBuf.shift();
+  var sm=cur.altBuf.reduce(function(a,b){return a+b},0)/cur.altBuf.length;
+  cur.lastAlt=sm;
+  if(cur.startAlt==null&&cur.altBuf.length>=3)cur.startAlt=sm;
+  if(cur.ref==null)cur.ref=sm;
+  else if(Math.abs(sm-cur.ref)>=ELEV_STEP){
+   if(sm>cur.ref)cur.gain+=sm-cur.ref;else cur.loss+=cur.ref-sm;
+   cur.ref=sm;
+  }
+  pt.alt=Math.round(sm*10)/10;
+ } else pt.alt=null;
+ pts.push({lat:+pt.lat.toFixed(6),lon:+pt.lon.toFixed(6),t:pt.t,alt:pt.alt});
+ var ll=[pt.lat,pt.lon];
+ line.addLatLng(ll);
+ if(!dot)dot=L.circleMarker(ll,{radius:8,color:"#fff",weight:3,fillColor:"#1971c2",fillOpacity:1}).addTo(map);
+ else dot.setLatLng(ll);
+ if(!startMk)startMk=L.marker([pts[0].lat,pts[0].lon]).addTo(map);
+ map.panTo(ll);
+ lsSet(ACT,cur);
+ render();
+}
+function onErr(e){
+ $("msg").textContent=e.code===1?"Location permission denied. Allow location for this site and reload.":"GPS error: "+e.message;
+}
+function clearMap(){
+ line.setLatLngs([]);
+ if(dot){map.removeLayer(dot);dot=null}
+ if(startMk){map.removeLayer(startMk);startMk=null}
+}
+async function keepAwake(){
+ if(NATIVE)return;
+ try{if("wakeLock" in navigator)wake=await navigator.wakeLock.request("screen")}catch(e){}
+}
+document.addEventListener("visibilitychange",function(){
+ if(document.visibilityState==="visible"&&cur&&cur.running)keepAwake();
+});
+function setButtons(){
+ var on=!!cur;
+ $("btnStart").disabled=on; $("btnPause").disabled=!on; $("btnStop").disabled=!on;
+ $("btnPause").textContent=cur&&!cur.running?"Resume":"Pause";
+}
+function startWatch(){
+ timer=setInterval(render,1000);
+ if(NATIVE){
+  var cbk=function(loc,err){
+    if(err){
+     if(err.code==="NOT_AUTHORIZED"){$("msg").textContent="Location permission needed. Set it to 'Allow all the time' or 'While using' in app settings.";BG.openSettings()}
+     else $("msg").textContent="GPS error: "+(err.message||err.code);
+     return;
+    }
+    onFix({coords:{latitude:loc.latitude,longitude:loc.longitude,altitude:loc.altitude,accuracy:loc.accuracy},timestamp:loc.time});
+  };
+  var r=BG.addWatcher({backgroundTitle:"Walk Tracker",backgroundMessage:"Recording your walk",requestPermissions:true,stale:false,distanceFilter:3},cbk);
+  Promise.resolve(r).then(function(id){watchId=id;$("msg").textContent="Tracking started. Waiting for GPS fix…"})
+   .catch(function(e){$("msg").textContent="Tracker failed to start: "+((e&&e.message)||e)});
+  return;
+ }
+ if(!navigator.geolocation){$("msg").textContent="Geolocation not supported on this device.";return}
+ watchId=navigator.geolocation.watchPosition(onFix,onErr,{enableHighAccuracy:true,maximumAge:0,timeout:30000});
+ keepAwake();
+}
+function stopWatch(){
+ if(watchId!=null){
+  if(NATIVE){try{Promise.resolve(BG.removeWatcher({id:watchId})).catch(function(){})}catch(e){}}else navigator.geolocation.clearWatch(watchId);
+ }
+ watchId=null; clearInterval(timer); timer=null;
+ try{if(wake)wake.release()}catch(e){} wake=null;
+}
+$("btnStart").onclick=function(){
+ $("msg").textContent="Starting…"; hideProfile(); clearMap();
+ cur={id:Date.now(),start:Date.now(),acc:0,since:Date.now(),running:true,dist:0,gain:0,loss:0,startAlt:null,
+      ref:null,lastAlt:null,altBuf:[],pts:[],time:0};
+ lsSet(ACT,cur); setButtons(); render(); startWatch();
+ $("msg").textContent="Waiting for GPS fix…";
+};
+$("btnPause").onclick=function(){
+ if(!cur)return;
+ if(cur.running){cur.acc+=(Date.now()-cur.since)/1000;cur.running=false;$("msg").textContent="Paused"}
+ else{cur.since=Date.now();cur.running=true;cur.altBuf=[];$("msg").textContent="Resumed"}
+ lsSet(ACT,cur); setButtons(); render();
+};
+$("btnStop").onclick=function(){
+ if(!cur)return;
+ if(cur.running){cur.acc+=(Date.now()-cur.since)/1000;cur.running=false}
+ stopWatch(); cur.time=cur.acc;
+ var w=cur; cur=null; lsDel(ACT); setButtons();
+ if(w.pts.length>1){
+  walks.unshift({id:w.id,start:w.start,time:w.time,dist:w.dist,gain:w.gain,loss:w.loss,delta:(w.startAlt==null||w.lastAlt==null?0:w.lastAlt-w.startAlt),pts:w.pts});
+  lsSet(KEY,walks); $("msg").textContent="Walk saved.";
+  showWalk(w.id);
+ } else $("msg").textContent="Walk too short to save.";
+ listWalks();
+};
+$("unitBtn").onclick=function(){imperial=!imperial;lsSet(UNIT,imperial);render();listWalks();if(shown)drawProfile(shown)};
+
+/* ---- saved walks ---- */
+var shown=null;
+function find(id){for(var i=0;i<walks.length;i++)if(walks[i].id===id)return walks[i]}
+function showWalk(id){
+ var w=find(id); if(!w)return; shown=w;
+ clearMap();
+ var ll=w.pts.map(function(p){return[p.lat,p.lon]});
+ line.setLatLngs(ll);
+ startMk=L.marker(ll[0]).addTo(map);
+ dot=L.circleMarker(ll[ll.length-1],{radius:7,color:"#fff",weight:3,fillColor:"#c0392b",fillOpacity:1}).addTo(map);
+ map.fitBounds(line.getBounds(),{padding:[24,24]});
+ if(!cur){
+  $("sDist").textContent=dist(w.dist).toFixed(2);$("sTime").textContent=fmtT(w.time);
+  $("sPace").textContent=pace(w);$("sDelta").textContent=Math.round(elev(w.gain||0));
+  var al=w.pts.filter(function(p){return p.alt!=null});
+  $("sElev").textContent=al.length?Math.round(elev(al[al.length-1].alt)):"--";
+ }
+ drawProfile(w);
+ window.scrollTo({top:0,behavior:"smooth"});
+}
+function hideProfile(){$("prof").hidden=true;shown=null}
+function drawProfile(w){
+ var pts=w.pts.filter(function(p){return p.alt!=null});
+ var cv=$("prof"); if(pts.length<2){cv.hidden=true;return}
+ cv.hidden=false;
+ var W=cv.clientWidth,H=cv.clientHeight,dpr=window.devicePixelRatio||1;
+ cv.width=W*dpr;cv.height=H*dpr;var g=cv.getContext("2d");g.scale(dpr,dpr);
+ var cum=[0];for(var i=1;i<pts.length;i++)cum.push(cum[i-1]+hav(pts[i-1],pts[i]));
+ var mn=Math.min.apply(null,pts.map(function(p){return p.alt})),mx=Math.max.apply(null,pts.map(function(p){return p.alt}));
+ if(mx-mn<5){mx=mn+5}
+ var pad=22,tot=cum[cum.length-1]||1;
+ g.clearRect(0,0,W,H);g.strokeStyle="#1f6f4a";g.fillStyle="rgba(31,111,74,.18)";g.lineWidth=2;
+ g.beginPath();
+ pts.forEach(function(p,i){var x=pad+(W-pad-6)*cum[i]/tot,y=H-14-(H-26)*(p.alt-mn)/(mx-mn);i?g.lineTo(x,y):g.moveTo(x,y)});
+ g.stroke();g.lineTo(W-6,H-14);g.lineTo(pad,H-14);g.closePath();g.fill();
+ g.fillStyle="#64756b";g.font="11px system-ui";
+ g.fillText(Math.round(elev(mx))+(imperial?" ft":" m"),4,12);
+ g.fillText(Math.round(elev(mn))+(imperial?" ft":" m"),4,H-2);
+}
+function gpx(w){
+ var s='<?xml version="1.0"?><gpx version="1.1" creator="Walk Tracker" xmlns="http://www.topografix.com/GPX/1/1"><trk><name>Walk '+new Date(w.start).toLocaleString()+'</name><trkseg>';
+ w.pts.forEach(function(p){s+='<trkpt lat="'+p.lat+'" lon="'+p.lon+'">'+(p.alt!=null?'<ele>'+p.alt+'</ele>':'')+'<time>'+new Date(p.t).toISOString()+'</time></trkpt>'});
+ return s+'</trkseg></trk></gpx>';
+}
+function download(w){
+ var name="walk-"+new Date(w.start).toISOString().slice(0,10)+".gpx";
+ if(NATIVE){
+  var FS=Capacitor.Plugins.Filesystem,SH=Capacitor.Plugins.Share;
+  FS.writeFile({path:name,data:gpx(w),directory:"CACHE",encoding:"utf8"})
+   .then(function(r){return SH.share({title:name,url:r.uri})})
+   .catch(function(e){$("msg").textContent="Export failed: "+(e.message||e)});
+  return;
+ }
+ var b=new Blob([gpx(w)],{type:"application/gpx+xml"}),a=document.createElement("a");
+ a.href=URL.createObjectURL(b);a.download=name;
+ document.body.appendChild(a);a.click();a.remove();
+}
+function listWalks(){
+ var box=$("list");box.innerHTML="";
+ var td=0,tt=0;
+ walks.forEach(function(w){
+  td+=w.dist;tt+=w.time;
+  var d=new Date(w.start),el=document.createElement("div");el.className="walk";
+  el.innerHTML='<div><div class="t">'+d.toLocaleDateString(undefined,{weekday:"short",month:"short",day:"numeric"})+
+   ' · '+d.toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})+'</div><div class="s">'+
+   dist(w.dist).toFixed(2)+(imperial?" mi":" km")+' · '+fmtT(w.time)+' · ▲'+Math.round(elev(w.gain||0))+(imperial?" ft":" m")+'</div></div><div><button data-a="v">Map</button><button data-a="g">GPX</button><button data-a="x">✕</button></div>';
+  el.querySelectorAll("button").forEach(function(b){b.onclick=function(){
+   var a=b.dataset.a;
+   if(a==="v")showWalk(w.id);
+   else if(a==="g")download(w);
+   else if(confirm("Delete this walk?")){walks=walks.filter(function(x){return x.id!==w.id});lsSet(KEY,walks);if(shown===w){clearMap();hideProfile()}listWalks()}
+  }});
+  box.appendChild(el);
+ });
+ $("tot").textContent=walks.length?walks.length+" walks · "+dist(td).toFixed(1)+(imperial?" mi":" km")+" · "+fmtT(tt):"No walks yet. Tap Start walk.";
+}
+
+/* ---- recover an interrupted walk ---- */
+var saved=lsGet(ACT,null);
+if(saved&&saved.pts&&saved.pts.length){
+ cur=saved; if(cur.running){cur.acc+=(Date.now()-cur.since)/1000;} cur.running=false;
+ line.setLatLngs(cur.pts.map(function(p){return[p.lat,p.lon]}));
+ var lp=cur.pts[cur.pts.length-1];
+ dot=L.circleMarker([lp.lat,lp.lon],{radius:8,color:"#fff",weight:3,fillColor:"#1971c2",fillOpacity:1}).addTo(map);
+ startMk=L.marker([cur.pts[0].lat,cur.pts[0].lon]).addTo(map);
+ map.fitBounds(line.getBounds(),{padding:[24,24]});
+ startWatch(); $("msg").textContent="Recovered unfinished walk (paused). Tap Resume or Stop.";
+} else if(saved){lsDel(ACT)}
+setButtons();render();listWalks();
+if(!cur&&navigator.geolocation){
+ navigator.geolocation.getCurrentPosition(function(p){map.setView([p.coords.latitude,p.coords.longitude],15)},function(){},{timeout:8000});
+}
+})();
+</script>
+</body>
+</html>
